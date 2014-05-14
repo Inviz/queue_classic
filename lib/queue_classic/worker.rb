@@ -10,6 +10,7 @@ module QC
     # Creates a new worker but does not start the worker. See Worker#start.
     # This method takes a single hash argument. The following keys are read:
     # fork_worker:: Worker forks each job execution.
+    # asynchronous:: When true, the parent process doesnt wait for forks
     # wait_interval:: Time to wait between failed lock attempts
     # connection:: PGConn object.
     # q_name:: Name of a single queue to process.
@@ -18,9 +19,12 @@ module QC
     def initialize(args={})
       @fork_worker = args[:fork_worker] || QC::FORK_WORKER
       @wait_interval = args[:wait_interval] || QC::WAIT_TIME
+      @asynchronous = args[:asynchronous] || QC::ASYNCHRONOUS_WORKER
 
       if args[:connection]
         @conn_adapter = ConnAdapter.new(args[:connection])
+      elsif @asynchronous
+        @conn_adapter = QC.default_conn_adapter
       elsif QC.has_connection?
         @conn_adapter = QC.default_conn_adapter
       end
@@ -41,7 +45,7 @@ module QC
     def start
       unlock_jobs_of_dead_workers()
       while @running
-        @fork_worker ? fork_and_work : work
+        work
       end
     end
 
@@ -56,21 +60,13 @@ module QC
       @running = false
     end
 
-    # Calls Worker#work but after the current process is forked.
-    # The parent process will wait on the child process to exit.
-    def fork_and_work
-      cpid = fork {setup_child; work}
-      log(:at => :fork, :pid => cpid)
-      Process.wait(cpid)
-    end
-
     # Blocks on locking a job, and once a job is locked,
     # it will process the job.
-    def work
+    def work(&block)
       queue, job = lock_job
       if queue && job
         QC.log_yield(:at => "work", :job => job[:id]) do
-          process(queue, job)
+          process(queue, job, &block)
         end
       end
     end
@@ -108,34 +104,90 @@ module QC
     # to do with the job is delegated to Worker#handle_failure.
     # If the job is not finished and an INT signal is traped,
     # this method will unlock the job in the queue.
-    def process(queue, job)
+    def process(queue, job, &callback)
       start = Time.now
-      finished = false
-      begin
-        call(job).tap do
-          queue.delete(job[:id])
-          finished = true
-        end
-      rescue => e
-        handle_failure(job, e)
-        finished = true
-      ensure
-        if !finished
-          queue.unlock(job[:id])
-        end
-        ttp = Integer((Time.now - start) * 1000)
-        QC.measure("time-to-process=#{ttp} source=#{queue.name}")
+      call(job, callback) do |result|
+        log_result(queue, job, result, start)
+        result
       end
+    end
+
+    def log_result(queue, job, result, start)
+      ttp = Integer((Time.now - start) * 1000)
+      QC.measure("time-to-process=#{ttp} source=#{queue.name}")
+      if (Exception === result)
+        log_failure(queue, job, result)
+      else
+        log_success(queue, job, result)
+      end
+      result
+    end
+
+    def log_failure(queue, job, result)
+      queue.unlock(job[:id])
+      handle_failure(job, result)
+    end
+
+    def log_success(queue, job, result)
+      queue.delete(job[:id])
+    end
+
+    def call(job, callback = nil, &block)
+      if @fork_worker
+        call_forked(job, callback, &block)
+      else
+        yield call_inline(job)
+      end
+    rescue => e
+      yield e 
     end
 
     # Each job includes a method column. We will use ruby's eval
     # to grab the ruby object from memory. We send the method to
     # the object and pass the args.
-    def call(job)
+    def call_inline(job)
       args = job[:args]
       receiver_str, _, message = job[:method].rpartition('.')
       receiver = eval(receiver_str)
       receiver.send(message, *args)
+    end
+
+    # Invoke worker inside a forked process. Worker should NOT
+    # use shared pg connection, as it corrupts it. It pipes the 
+    # result back via IO.pipe, passes exceptions through.
+    # To use pg inside worker, use connection pool or a fresh connection
+    def call_forked(job, callback = nil)
+      read, write = IO.pipe
+      prepare_child
+      fork_pid = fork do
+        setup_child
+        begin
+          result = call_inline(job)
+        rescue => e
+          result = e
+        ensure
+          callback.call(result) if callback
+          # Asynchronous workers should log completion on their own
+          if @asynchronous
+            yield result
+          else
+            read.close
+            Marshal.dump(result, write)
+          end
+          # Exit forked process without running exit handlers 
+          # so pg connection is not corrupted
+          exit!(0) 
+        end
+      end
+      log(:at => :fork, :pid => fork_pid)
+      unless @asynchronous
+        write.close
+        marshalled = read.read
+        Process.wait(fork_pid)
+        yield Marshal.load(marshalled)
+      else
+        fork_pid
+      end
     end
 
     # This method will be called when an exception
@@ -148,6 +200,15 @@ module QC
     # your worker is forking and you need to
     # re-establish database connections
     def setup_child
+      if @asynchronous && QC.default_conn_adapter.needs_its_own_connection?
+        QC.default_conn_adapter.reestablish
+      end
+    end
+
+    # This method is called before process is forked
+    # We avoid using pg inside a forked process,
+    # so logging has to happen her
+    def prepare_child
       log(:at => "setup_child")
     end
 

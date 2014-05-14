@@ -6,6 +6,7 @@ module TestObject
   def one_arg(a); return a; end
   def two_args(a,b); return [a,b]; end
   def forty_two; OpenStruct.new(number: 42); end
+  def qc_count; QC.count; end
 end
 
 # This not only allows me to test what happens
@@ -26,7 +27,9 @@ class TestWorker < QC::Worker
   end
 end
 
+
 class WorkerTest < QCTest
+
 
   def test_work
     QC.enqueue("TestObject.no_args")
@@ -42,6 +45,7 @@ class WorkerTest < QCTest
     worker = TestWorker.new
     worker.work
     assert_equal(1, worker.failed_count)
+    assert_equal(1, QC.count)
   end
 
   def test_failed_job_is_logged
@@ -192,6 +196,154 @@ class WorkerTest < QCTest
     # We should have an unlocked job now
     res = adapter.connection.exec(query_locked_jobs)
     assert_equal(1, res.count)
+    adapter.connection.close
+  end
+
+  def test_forked_work_success
+    QC.enqueue("Process.pid")
+    worker = TestWorker.new fork_worker: true
+    chpid = worker.work
+    assert(Process.pid != chpid && chpid > 0)
+    assert_equal(0, QC.count)
+    assert_equal(0, worker.failed_count)
+  end
+
+  def test_forked_work_failure
+    QC.enqueue("TestObject.not_a_method")
+    worker = TestWorker.new fork_worker: true
+    output = capture_stderr_output do
+      worker.work
+    end
+    assert(output.include?("#<NoMethodError: undefined method `not_a_method'"))
+    assert_equal(1, QC.count)
+    assert_equal(1, worker.failed_count)
+  end
+
+  def test_mixed_forked_and_unforked_work_success
+    QC.enqueue("Process.pid")
+    QC.enqueue("Process.pid")
+    forked = TestWorker.new fork_worker: true
+    current = TestWorker.new
+    forkedpid = forked.work
+    currentpid = current.work
+    assert(Process.pid != forkedpid && forkedpid > 0)
+    assert(Process.pid == currentpid)
+    assert_equal(0, QC.count)
+    assert_equal(0, current.failed_count)
+    assert_equal(0, forked.failed_count)
+  end
+
+
+  def test_forked_work_that_does_no_sql
+    QC.enqueue("TestObject.qc_count")
+    worker = TestWorker.new fork_worker: true
+    read, write = IO.pipe
+    object_id = QC.default_conn_adapter.connection.object_id
+    assert_equal(1, QC.count)
+    output = worker.work do
+      read.close
+      Marshal.dump(QC.default_conn_adapter.connection.object_id, write)
+    end
+
+    write.close
+    marshalled = read.read
+    new_object_id = Marshal.load(marshalled)
+    assert(new_object_id != object_id, "should establish another connection")
+    
+    assert_equal(0, QC.count)
+    assert_equal(0, worker.failed_count)
+  end
+
+
+  def test_forked_work_that_does_no_sql
+    QC.enqueue("TestObject.no_args")
+    worker = TestWorker.new fork_worker: true
+    read, write = IO.pipe
+    object_id = QC.default_conn_adapter.connection.object_id
+    assert_equal(1, QC.count)
+    output = worker.work do
+      read.close
+      Marshal.dump(QC.default_conn_adapter.connection.object_id, write)
+    end
+
+    write.close
+    marshalled = read.read
+    new_object_id = Marshal.load(marshalled)
+    assert(new_object_id == object_id, "should not another connection")
+    
+    assert_equal(0, QC.count)
+    assert_equal(0, worker.failed_count)
+  end
+
+  def test_async_forked_work_that_does_sql
+    QC.enqueue("QC.default_conn_adapter.execute", "SELECT 123 as value")
+    worker = TestWorker.new fork_worker: true, asynchronous: true
+    read, write = IO.pipe
+    object_id = QC.default_conn_adapter.connection.object_id
+    fork_pid = worker.work do
+      read.close
+      Marshal.dump(QC.default_conn_adapter.connection.object_id, write)
+    end
+    assert_equal(1, QC.count) # not yet executed
+    assert_equal(0, worker.failed_count)
+    write.close
+    marshalled = read.read
+    Process.wait(fork_pid)
+    new_object_id = Marshal.load(marshalled)
+    assert(new_object_id != object_id, "should establish new connection")
+    assert_equal(0, QC.count)
+    assert_equal(0, worker.failed_count)
+  end
+
+  def test_mixed_workers
+    QC.enqueue("TestObject.one_arg", 1)
+    QC.enqueue("TestObject.one_arg", 1)
+    QC.enqueue("TestObject.one_arg", 1)
+    QC.enqueue("TestObject.one_arg", 1)
+    QC.enqueue("TestObject.one_arg", 1)
+    QC.enqueue("TestObject.one_arg", 1)
+
+    async1 = TestWorker.new fork_worker: true, asynchronous: true
+    async2 = TestWorker.new fork_worker: true, asynchronous: true
+    fork1 = TestWorker.new fork_worker: true
+    fork2 = TestWorker.new fork_worker: true
+    sync1 = TestWorker.new
+    sync2 = TestWorker.new
+
+
+    assert_equal(6, QC.count) # not yet executed
+    f1 = fork1.work
+    assert_equal(5, QC.count) # executed synchronously
+    f2 = fork2.work
+    assert_equal(4, QC.count) # executed synchronously
+
+    a1 = async1.work
+    a2 = async2.work
+    assert_equal(4, QC.count) # not yet executed
+
+    s1 = sync1.work
+    assert_equal(3, QC.count) # executed synchronously
+    s2 = sync2.work
+    assert_equal(2, QC.count) # executed synchronously
+
+    assert_equal(2, QC.count) # async not done here
+    Process.wait(a1)
+    Process.wait(a2)
+    assert_equal(0, QC.count) # not yet executed
+
+  end
+
+  def test_work_connection_reuse
+    QC.enqueue("QC.default_conn_adapter.execute", "SELECT 123 as value")
+    worker = TestWorker.new
+    result = nil
+    output = capture_stderr_output do
+      result = worker.work
+    end
+    assert(!output.include?("<RuntimeError: Forked workers should create a new DB connection"))
+    assert_equal("123", result["value"])
+    assert_equal(0, QC.count)
+    assert_equal(0, worker.failed_count)
   end
 
 end

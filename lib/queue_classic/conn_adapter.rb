@@ -7,11 +7,23 @@ module QC
 
     attr_accessor :connection
     def initialize(c=nil)
+      @pid = Process.pid
       @connection = c.nil? ? establish_new : validate!(c)
       @mutex = Mutex.new
     end
 
+    def reestablish
+      @connection = establish_new;
+      @mutex = Mutex.new
+    end
+
+    def needs_its_own_connection?
+      @pid != Process.pid
+    end
+
     def execute(stmt, *params)
+      reestablish if needs_its_own_connection?
+
       @mutex.synchronize do
         QC.log(:at => "exec_sql", :sql => stmt.inspect)
         begin
